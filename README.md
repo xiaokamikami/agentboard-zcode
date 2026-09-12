@@ -14,6 +14,13 @@ AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务�
 - 增量同步：每个 (session, date) 的聚合内容做哈希，存于 `~/.agentboard/zcode-sync-state.<hostname>.json`；无变化不重复上传，依赖服务端 (session_id, user, date) 幂等 upsert。
 - 消息/工具只上传数量和工具名计数，不上传 prompt、回复、代码或路径内容。
 
+### 静默运行设计（内存与开销不随历史增长）
+
+- **签名快速路径**：每次同步先对 DB 做一次纯 SQL 聚合签名（行数/最大时间戳/token 总和）。签名没变（ZCode 空闲时）直接跳过整个采集流程，只有几毫秒开销。
+- **滑动窗口**：默认只采集最近 45 天（`AGENTBOARD_ZCODE_DAYS` 可调，最小 1）。更早的数据早已上传到服务端，不会再读、不会进 state，扫描时间和内存都是有界的。
+- **合并区间代替事件点**：每天的活动时间用"合并后的区间列表"（每段一条）维护，而不是逐事件点，内存 O(活跃段数) 而非 O(事件数)，重度使用一整天也只有几十个区间。
+- 守护进程（launchd 每 5 分钟）实际运行内存约 **34MB** 峰值；`--summary`（全量诊断用）约为其 9 倍属正常。
+
 ## 安装
 
 前提：本机已按官方脚本安装 AgentBoard CLI（存在 `~/.agentboard/config.json` 和 launchd 定时任务 `cc.agentboard.codex-sync`）。
@@ -47,6 +54,7 @@ AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务�
 ### 可配置项
 
 - `AGENTBOARD_ZCODE_DB`：ZCode 数据库路径覆盖（默认 `~/.zcode/cli/db/db.sqlite`），测试或多实例时使用。
+- `AGENTBOARD_ZCODE_DAYS`：滑动窗口天数（默认 45），设得越大回溯的历史越多。改大之后下次同步会把窗口内新纳入的天自动补传（幂等）。
 
 ### 回滚
 

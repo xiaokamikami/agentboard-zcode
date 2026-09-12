@@ -35,6 +35,12 @@ __version__ = AGENTBOARD_SCRIPT_RELEASE
 CODEX_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:codex-replay.1"
 ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.5"
 ZCODE_DB_DEFAULT = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+# Only collect ZCode usage from the last N days; older days were already uploaded
+# and stay on the server. Keeps scan time, memory and state file bounded.
+try:
+    ZCODE_MAX_DAYS = max(1, int(os.environ.get("AGENTBOARD_ZCODE_DAYS", "45")))
+except ValueError:
+    ZCODE_MAX_DAYS = 45
 CODEX_REPLAY_GAP_SECS = 10
 CODEX_REPLAY_MIN_EVENTS = 100
 CODEX_PROVIDER_TOTAL_POLICY_START_DATE = "2026-04-21"
@@ -666,9 +672,10 @@ def zcode_db_signature(db_path):
             "SELECT "
             "(SELECT COUNT(*) FROM session), "
             "COALESCE((SELECT MAX(time_updated) FROM session), 0), "
-            "(SELECT COUNT(*) FROM turn_usage), "
-            "COALESCE((SELECT MAX(completed_at) FROM turn_usage), 0), "
-            "COALESCE((SELECT SUM(input_tokens + output_tokens + reasoning_tokens + cache_creation_input_tokens + cache_read_input_tokens) FROM turn_usage), 0), "
+            "(SELECT COUNT(*) FROM model_usage), "
+            "COALESCE((SELECT MAX(started_at) FROM model_usage), 0), "
+            "COALESCE((SELECT MAX(completed_at) FROM model_usage), 0), "
+            "COALESCE((SELECT SUM(input_tokens + output_tokens + reasoning_tokens + cache_creation_input_tokens + cache_read_input_tokens + computed_total_tokens) FROM model_usage), 0), "
             "(SELECT COUNT(*) FROM message), "
             "COALESCE((SELECT MAX(time_updated) FROM message), 0), "
             "(SELECT COUNT(*) FROM tool_usage), "
@@ -708,13 +715,38 @@ def zcode_day_state():
         "files_touched": set(),
         "lines_added": 0,
         "lines_removed": 0,
-        "points": [],
+        # Merged activity runs [[start, end]] in epoch seconds; one entry per
+        # gap-bridged stretch instead of one entry per event, so per-day memory
+        # stays bounded no matter how many events accumulate.
+        "runs": [],
     }
 
 
 def zcode_add_point(day, epoch_ms):
-    if epoch_ms:
-        day["points"].append(safe_int(epoch_ms) / 1000.0)
+    if not epoch_ms:
+        return
+    ts = safe_int(epoch_ms) / 1000.0
+    runs = day["runs"]
+    low, high = 0, len(runs)
+    while low < high:
+        mid = (low + high) // 2
+        if runs[mid][0] <= ts:
+            low = mid + 1
+        else:
+            high = mid
+    index = low
+    touches_previous = index > 0 and ts - runs[index - 1][1] <= CODEX_IDLE_GAP_SECS
+    touches_next = index < len(runs) and runs[index][0] - ts <= CODEX_IDLE_GAP_SECS
+    if touches_previous and touches_next:
+        runs[index - 1][1] = runs[index][1]
+        del runs[index]
+    elif touches_previous:
+        if ts > runs[index - 1][1]:
+            runs[index - 1][1] = ts
+    elif touches_next:
+        runs[index][0] = ts
+    else:
+        runs.insert(index, [ts, ts])
 
 
 def zcode_add_request(day, request, session_directory):
@@ -736,32 +768,39 @@ def zcode_add_request(day, request, session_directory):
     zcode_add_point(day, request.get("completed_at"))
 
 
-def zcode_build_windows(points):
-    # Gap-bridged active windows over event points; must match build_engaged_windows
-    # exactly: a run ends at last event + gap cap, except the day's final run which
-    # ends at last event + session tail.
-    if not points:
+def zcode_merge_runs(runs):
+    ordered = sorted(runs)
+    merged = []
+    for start, end in ordered:
+        if merged and start - merged[-1][1] <= CODEX_IDLE_GAP_SECS:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def zcode_build_windows(runs):
+    # Gap-bridged active windows over merged activity runs; must match
+    # build_engaged_windows exactly: a run ends at last event + gap cap, except
+    # the day's final run which ends at last event + session tail. Runs from
+    # different sessions on the same day may need re-merging, so normalize first.
+    merged = zcode_merge_runs(runs)
+    if not merged:
         return []
-    ordered = sorted(points)
     windows = []
-    run_start = previous = ordered[0]
-    for ts in ordered[1:]:
-        if ts - previous <= CODEX_IDLE_GAP_SECS:
-            previous = ts
-            continue
-        windows.append((run_start, previous + CODEX_IDLE_GAP_SECS))
-        run_start = previous = ts
-    windows.append((run_start, previous + SESSION_TAIL_SECS))
+    for run in merged[:-1]:
+        windows.append((run[0], run[1] + CODEX_IDLE_GAP_SECS))
+    windows.append((merged[-1][0], merged[-1][1] + SESSION_TAIL_SECS))
     return windows
 
 
 def zcode_finalize_day(data, max_minutes):
-    points = data.get("points", [])
-    windows = zcode_build_windows(points)
+    runs = zcode_merge_runs(data.get("runs", []))
+    windows = zcode_build_windows(runs)
     if not windows:
         return None
-    first_event = zcode_datetime(min(points) * 1000)
-    last_event = zcode_datetime(max(points) * 1000)
+    first_event = zcode_datetime(runs[0][0] * 1000)
+    last_event = zcode_datetime(runs[-1][1] * 1000)
     active_seconds = int(sum(end - start for start, end in windows))
     output_tokens = safe_int(data.get("output_tokens"))
     return {
@@ -808,6 +847,12 @@ def zcode_collect_sessions(verbose=False):
             return None
         return session_days[session_id][stamp.strftime("%Y-%m-%d")]
 
+    # Sliding window: rows older than the cutoff were uploaded long ago and are
+    # immutable history, so skip them entirely to keep scans bounded.
+    cutoff_ms = int((datetime.now().astimezone() - timedelta(days=ZCODE_MAX_DAYS - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp() * 1000)
+
     try:
         connection = zcode_db_connect(db_path)
         session_dirs = {}
@@ -823,7 +868,8 @@ def zcode_collect_sessions(verbose=False):
             "SELECT session_id, logical_request_id, status, started_at, completed_at, "
             "input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, "
             "cache_read_input_tokens, computed_total_tokens "
-            "FROM model_usage ORDER BY session_id, started_at, logical_request_id"
+            "FROM model_usage WHERE started_at >= ? ORDER BY session_id, started_at, logical_request_id",
+            (cutoff_ms,),
         )
         for session_id, request_key, status, started_ms, completed_ms, total_input, output_tokens, reasoning_tokens, cache_creation, cache_read, computed_total in request_cursor:
             request_count += 1
@@ -860,7 +906,9 @@ def zcode_collect_sessions(verbose=False):
         try:
             connection.execute("SELECT json_extract('{}', '$.a')")
             message_cursor = connection.execute(
-                "SELECT session_id, time_created, json_extract(data, '$.role') FROM message ORDER BY time_created"
+                "SELECT session_id, time_created, json_extract(data, '$.role') FROM message "
+                "WHERE time_created >= ? ORDER BY time_created",
+                (cutoff_ms,),
             )
             for session_id, epoch_ms, role in message_cursor:
                 message_count += 1
@@ -876,7 +924,8 @@ def zcode_collect_sessions(verbose=False):
                 zcode_add_point(day, epoch_ms)
         except sqlite3.OperationalError:
             for session_id, epoch_ms, raw_data in connection.execute(
-                "SELECT session_id, time_created, data FROM message ORDER BY time_created"
+                "SELECT session_id, time_created, data FROM message WHERE time_created >= ? ORDER BY time_created",
+                (cutoff_ms,),
             ):
                 message_count += 1
                 if session_id not in sessions_with_requests:
@@ -895,7 +944,8 @@ def zcode_collect_sessions(verbose=False):
                 zcode_add_point(day, epoch_ms)
 
         for session_id, epoch_ms, tool_name in connection.execute(
-            "SELECT session_id, started_at, tool_name FROM tool_usage ORDER BY started_at"
+            "SELECT session_id, started_at, tool_name FROM tool_usage WHERE started_at >= ? ORDER BY started_at",
+            (cutoff_ms,),
         ):
             tool_count += 1
             if session_id not in sessions_with_requests:
@@ -930,7 +980,7 @@ def zcode_collect_sessions(verbose=False):
             merged = merged_days[date_str]
             for key in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens", "provider_total_tokens", "user_msgs", "assistant_msgs", "tool_calls", "lines_added", "lines_removed"):
                 merged[key] += data.get(key, 0)
-            merged["points"].extend(data["points"])
+            merged["runs"].extend(data["runs"])
             merged["projects"].update(data["projects"])
             for tool_name, count in data["tool_counts"].items():
                 merged["tool_counts"][tool_name] += count
@@ -1345,18 +1395,27 @@ def load_zcode_sync_state():
         with open(state_path, encoding="utf-8") as f:
             raw_state = json.load(f)
     except Exception:
-        return state_path, {}, True
+        return state_path, {}, True, ""
     if not isinstance(raw_state, dict) or raw_state.get("_collector_version") != ZCODE_SYNC_STATE_VERSION:
-        return state_path, {}, True
+        return state_path, {}, True, ""
     entries = raw_state.get("entries")
     if not isinstance(entries, dict):
         entries = {}
-    return state_path, entries, False
+    return state_path, entries, False, str(raw_state.get("_db_signature") or "")
 
 
-def save_zcode_sync_state(state_path, entries):
+def save_zcode_sync_state(state_path, entries, db_signature):
     with open(state_path, "w", encoding="utf-8") as f:
-        json.dump({"_collector_version": ZCODE_SYNC_STATE_VERSION, "entries": entries}, f, indent=2, sort_keys=True)
+        json.dump(
+            {
+                "_collector_version": ZCODE_SYNC_STATE_VERSION,
+                "_db_signature": db_signature,
+                "entries": entries,
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
 
 
 def zcode_entry_signature(entry):
@@ -1369,12 +1428,17 @@ def zcode_entry_signature(entry):
 
 def sync_zcode(config, verbose=False):
     db_path = zcode_db_path()
-    state_path, known_entries, state_invalidated = load_zcode_sync_state()
+    state_path, known_entries, state_invalidated, known_signature = load_zcode_sync_state()
 
     signature = zcode_db_signature(db_path)
     if signature == "unavailable":
         log_sync_error("failed to read ZCode database signature", RuntimeError(signature))
         return {"scanned": 0, "skipped": 0, "synced": 0, "errors": 1, "state": state_path}
+
+    # Fast path: the signature aggregates row counts/timestamps/token sums for the
+    # whole database, so equality means nothing to collect or upload changed.
+    if not state_invalidated and known_signature and known_signature == signature:
+        return {"scanned": 0, "skipped": 0, "synced": 0, "errors": 0, "state": state_path, "unchanged": True}
 
     sessions, _, meta = zcode_collect_sessions(verbose=verbose)
     if meta.get("status") != "ok":
@@ -1390,6 +1454,11 @@ def sync_zcode(config, verbose=False):
             pending.append(entry)
 
     if not pending:
+        if next_entries != known_entries or known_signature != signature:
+            try:
+                save_zcode_sync_state(state_path, next_entries, signature)
+            except Exception:
+                pass
         return {"scanned": meta.get("scanned", 0), "skipped": len(sessions), "synced": 0, "errors": 0, "state": state_path}
 
     synced = 0
@@ -1403,7 +1472,7 @@ def sync_zcode(config, verbose=False):
                 )
             post_session(config, entry, full_rescan=state_invalidated)
             synced += 1
-        save_zcode_sync_state(state_path, next_entries)
+        save_zcode_sync_state(state_path, next_entries, signature)
     except Exception as error:
         log_sync_error("failed to sync ZCode database", error)
         return {"scanned": meta.get("scanned", 0), "skipped": 0, "synced": synced, "errors": 1, "state": state_path}
