@@ -33,7 +33,7 @@ SESSION_TAIL_SECS = 2 * 60
 AGENTBOARD_SCRIPT_RELEASE = "2026-04-30"
 __version__ = AGENTBOARD_SCRIPT_RELEASE
 CODEX_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:codex-replay.1"
-ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.5"
+ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.6"
 ZCODE_DB_DEFAULT = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
 # Only collect ZCode usage from the last N days; older days were already uploaded
 # and stay on the server. Keeps scan time, memory and state file bounded.
@@ -973,7 +973,7 @@ def zcode_collect_sessions(verbose=False):
                 continue
             entry = {
                 "date": date_str,
-                "session_id": f"codex:zcode:{session_id}",
+                "session_id": f"opencode:zcode:{session_id}",
                 **stats,
             }
             all_sessions.append(entry)
@@ -1278,11 +1278,11 @@ def recover_token_from_claim(config_path, config):
     return config
 
 
-def post_session(config, session_entry, full_rescan=False):
+def post_session(config, session_entry, full_rescan=False, source="codex"):
     payload = json.dumps(
         {
             "token": config["token"],
-            "source": "codex",
+            "source": source,
             "device_name": config.get("device_name", ""),
             "platform": config.get("platform", ""),
             "full_rescan": full_rescan,
@@ -1470,7 +1470,7 @@ def sync_zcode(config, verbose=False):
                     f"session={entry['session_id']} date={entry['date']} "
                     f"tokens={entry.get('tokens_used', 0)}"
                 )
-            post_session(config, entry, full_rescan=state_invalidated)
+            post_session(config, entry, full_rescan=state_invalidated, source="opencode")
             synced += 1
         save_zcode_sync_state(state_path, next_entries, signature)
     except Exception as error:

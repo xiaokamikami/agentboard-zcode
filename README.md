@@ -2,7 +2,7 @@
 
 让 [AgentBoard](https://agentboard.cc) 的 Codex 统计合并上报本机 [ZCode](https://zcode.ai) 的 token 用量。
 
-AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务端返回 404）。本仓库在官方 `collect_codex.py` 的基础上做了最小侵入修改：**仍然以 `source=codex` 上传**，ZCode 会话以 `codex:zcode:<session_id>` 为 ID，这样排行榜把 ZCode 用量显示在 Codex 名下，无需等服务端支持。
+AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务端返回 404）。本仓库在官方 `collect_codex.py` 的基础上做了最小侵入修改：**ZCode 用量以 `source=opencode` 上传**，会话 ID 为 `opencode:zcode:<session_id>`——这样 ZCode 的消耗在排行榜上单独显示在 OpenCode 名下，不会和真实 Codex 的用量混在一起，方便区分。
 
 ## 工作原理
 
@@ -39,7 +39,7 @@ AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务�
    python3 ~/.agentboard/collect_codex.py --summary
    ```
 
-   输出中会同时包含真实 Codex 与 `codex:zcode:` 前缀的 ZCode 会话。
+   输出中会同时包含真实 Codex 与 `opencode:zcode:` 前缀的 ZCode 会话。
 
 4. 手动同步一次并观察日志：
 
